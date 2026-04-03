@@ -1,7 +1,7 @@
-# EC2 Setup Guide: 6 Concurrent Claude Code Instances
+# EC2 Setup Guide: 9 Concurrent Claude Code Instances
 ### AWS Console Edition (v10 — Envoy Credential Proxy + Sandbox Runtime)
 
-A step-by-step guide using the AWS web console to set up a dedicated EC2 server for running up to 6 Claude Code instances simultaneously, each working on its own branch and pushing to GitHub.
+A step-by-step guide using the AWS web console to set up a dedicated EC2 server for running up to 9 Claude Code instances simultaneously, each working on its own branch and pushing to GitHub.
 
 **Daily workflow:** SSH in, type `code`, pick a repo, start coding. Repeat in as many terminals as you need.
 
@@ -346,7 +346,7 @@ For each one:
 
 ### Instance Type
 
-- `m6g.2xlarge` (8 vCPU, 32 GB RAM) for up to 6 concurrent agents
+- `m8g.2xlarge` (8 vCPU, 32 GB RAM, Graviton4) for up to 9 concurrent agents
 
 ### Key Pair
 
@@ -498,6 +498,14 @@ export GIT_TERMINAL_PROMPT=0
 # If you later add direct HTTPS remotes (bypassing the proxy), change to
 # GIT_ALLOW_PROTOCOL=http:https.
 export GIT_ALLOW_PROTOCOL=http
+
+# Skip system-level git config (/etc/gitconfig). This setup provides complete
+# git configuration via the immutable global ~/.gitconfig and per-invocation
+# -c flags — no system config is needed. Skipping it eliminates an attack
+# surface: if /etc/gitconfig were ever writable (e.g., via a privilege
+# escalation bug), any config key planted there would take effect for keys
+# not covered by safe_git()'s -c overrides.
+export GIT_CONFIG_NOSYSTEM=1
 
 safe_git() {
   git -c core.hooksPath=/dev/null -c core.fsmonitor= \
@@ -1190,7 +1198,7 @@ fi
 
 # ── Find an available slot (atomic via flock) ──
 claim_slot() {
-  for i in $(seq 1 6); do
+  for i in $(seq 1 9); do
     local lockfile="$LOCKS_DIR/slot-$i.lock"
     eval "exec 200>\"$lockfile\""
     if flock -n 200; then
@@ -1264,9 +1272,9 @@ pick_repo() {
 # ── Start socat bridges for a given slot ──
 start_bridges() {
   local slot=$1
-  local api_port=$((8080 + slot))   # 8081-8086
-  local git_port=$((8090 + slot))   # 8091-8096
-  local npm_port=$((8100 + slot))   # 8101-8106
+  local api_port=$((8080 + slot))   # 8081-8089
+  local git_port=$((8090 + slot))   # 8091-8099
+  local npm_port=$((8100 + slot))   # 8101-8109
 
   # Kill any orphaned socat processes from a previous session that exited
   # abnormally (SIGKILL, OOM kill) without running the trap handler.
@@ -1329,7 +1337,7 @@ show_status() {
   fi
 
   local active=0
-  for i in $(seq 1 6); do
+  for i in $(seq 1 9); do
     local slot_dir="$SLOTS_DIR/slot-$i"
 
     if is_slot_active "$i"; then
@@ -1351,7 +1359,7 @@ show_status() {
   done
 
   echo ""
-  echo "  $active / 6 active"
+  echo "  $active / 9 active"
   echo ""
 }
 
@@ -1363,8 +1371,8 @@ case "${1:-}" in
     ;;
   kill)
     KILL_SLOT="${2:?"Usage: code kill <slot-number>"}"
-    if ! [[ "$KILL_SLOT" =~ ^[1-6]$ ]]; then
-      echo "  Invalid slot number. Must be 1-6." >&2
+    if ! [[ "$KILL_SLOT" =~ ^[1-9]$ ]]; then
+      echo "  Invalid slot number. Must be 1-9." >&2
       exit 1
     fi
     # Use flock as the source of truth — not PID existence, which is
@@ -1426,7 +1434,7 @@ case "${1:-}" in
       fi
       echo "Fetched $repo_name"
     done
-    for i in $(seq 1 6); do
+    for i in $(seq 1 9); do
       slot_dir="$SLOTS_DIR/slot-$i"
       [ -d "$slot_dir" ] || continue
       if is_slot_active "$i"; then
@@ -1478,7 +1486,7 @@ show_status
 
 SLOT=$(claim_slot)
 if [ -z "$SLOT" ]; then
-  echo "  All 6 slots are in use."
+  echo "  All 9 slots are in use."
   exit 1
 fi
 
@@ -1592,6 +1600,20 @@ if [ ! -d "$SLOT_DIR" ]; then
 fi
 
 cd "$SLOT_DIR"
+
+# ── Validate worktree .git pointer integrity ──
+# The .git file in each worktree contains a gitdir: pointer to the backing
+# repo's .git/worktrees/slot-N directory. This file is within the sandbox's
+# write scope, so a previous sandboxed session could have rewritten it to
+# point at a different repo's gitdir. If tampered, the config.worktree
+# deletion and poison check below would operate on the wrong directory —
+# missing poison planted in the real gitdir.
+if [ -f "$SLOT_DIR/.git" ] && ! grep -q "workspaces/repos/$REPO_NAME/" "$SLOT_DIR/.git"; then
+  echo "  ERROR: worktree .git pointer has been tampered with." >&2
+  echo "  Expected reference to repos/$REPO_NAME, found:" >&2
+  cat "$SLOT_DIR/.git" | sed 's/^/    /' >&2
+  exit 1
+fi
 
 # ── Proactively clean worktree config from previous sessions ──
 # No legitimate worktree-specific config is needed in this setup (remote URL
@@ -1725,11 +1747,14 @@ if $HAS_NPM_PRIVATE; then
   #   //127.0.0.1:8104/:_authToken=dummy
   #   //127.0.0.1:8105/:_authToken=dummy
   #   //127.0.0.1:8106/:_authToken=dummy
+  #   //127.0.0.1:8107/:_authToken=dummy
+  #   //127.0.0.1:8108/:_authToken=dummy
+  #   //127.0.0.1:8109/:_authToken=dummy
   #
   # The _authToken lines are needed because npm requires auth config per
   # registry URL. The value doesn't matter ("dummy" is fine) — Envoy strips
   # the inbound Authorization header and injects the real token from Secrets
-  # Manager. All six ports are listed so the same .npmrc works regardless of
+  # Manager. All nine ports are listed so the same .npmrc works regardless of
   # which slot the session lands in.
   export NPM_PRIVATE_REGISTRY_URL="http://127.0.0.1:${NPM_PORT}"
   echo "  Private registry bridge: localhost:$NPM_PORT"
@@ -1751,12 +1776,33 @@ echo "  Claude exited. Bridges still active."
 echo "  Review, commit, and push. Ctrl-D to release slot."
 echo ""
 
-# ── Re-check for config poisoning planted during the sandboxed session ──
-# The sandboxed Claude session can write to .git/worktrees/slot-N/config.worktree.
-# Inside the sandbox this is inert (only 127.0.0.1 is reachable), but the
-# subshell below runs outside the sandbox with outbound HTTPS via the NAT
-# gateway. A planted pushInsteadOf could redirect `git push` to an attacker-
-# controlled endpoint, exfiltrating code.
+# ── Validate worktree .git pointer integrity ──
+# The sandboxed session could have rewritten the .git pointer to redirect
+# config.worktree deletion and poison checks to the wrong gitdir, causing
+# poison planted in the real gitdir to survive into the subshell.
+if [ -f "$SLOT_DIR/.git" ] && ! grep -q "workspaces/repos/$REPO_NAME/" "$SLOT_DIR/.git"; then
+  echo "  ERROR: worktree .git pointer tampered during Claude session." >&2
+  echo "  Expected reference to repos/$REPO_NAME, found:" >&2
+  cat "$SLOT_DIR/.git" | sed 's/^/    /' >&2
+  echo "  Releasing slot without subshell." >&2
+  exit 1
+fi
+
+# ── Remove worktree config planted during the sandboxed session ──
+# No legitimate worktree-specific config survives a session (remote URL is
+# env-overridden, identity is in the immutable global gitconfig). Deleting
+# unconditionally is a generic defense: it closes git alias poisoning
+# (alias.push = !exfil-script), http.proxy redirection, and any future
+# config key that could execute code — without needing to enumerate them.
+# The subshell below runs outside the sandbox with outbound HTTPS via the
+# NAT gateway, so any surviving config.worktree entry is a live threat.
+_wt_gitdir=$(safe_git rev-parse --git-dir 2>/dev/null || true)
+[ -n "$_wt_gitdir" ] && rm -f "$_wt_gitdir/config.worktree"
+
+# ── Re-check for config poisoning (safety net) ──
+# The delete above is the primary defense. This check catches anything the
+# delete somehow missed (e.g., config.worktree recreated between the delete
+# and this point, or poison in a config level other than worktree).
 if ! check_git_config_poison "$SLOT_DIR" "worktree"; then
   echo "  WARNING: Config poisoning detected in worktree after Claude session." >&2
   echo "  Do NOT run git commands. Inspect: git config --list --show-origin" >&2
@@ -1835,6 +1881,10 @@ safe_git clone "http://127.0.0.1:${GIT_PORT}/$REPO.git" "$REPOS_DIR/$REPO_NAME"
 
 cd "$REPOS_DIR/$REPO_NAME"
 
+# Remove hooks directory — three layers already prevent execution, but
+# eliminating the directory is a zero-cost generic defense.
+rm -rf .git/hooks
+
 # ── Enable per-worktree config to protect the shared .git/config ──
 # With worktreeConfig enabled, `git config --worktree` writes to a
 # per-worktree config.worktree file instead of the shared .git/config.
@@ -1855,19 +1905,18 @@ safe_git config extensions.worktreeConfig true
 # validates the path before applying the flag.
 sudo /usr/local/bin/lock-git-config "$REPOS_DIR/$REPO_NAME/.git/config"
 
-# Store repo metadata outside .git/ in a location not writable from inside
-# the sandbox. This prevents a sandboxed session from tampering with the
-# org/repo path or default branch used by trusted scripts.
-mkdir -p "$META_DIR/$REPO_NAME"
-echo "$REPO" > "$META_DIR/$REPO_NAME/github-path"
+# Store repo metadata via privileged helper. meta/ is root-owned to prevent
+# sandboxed sessions from tampering with the org/repo path or default branch
+# used by trusted scripts. The helper validates inputs and sets ownership.
 
-# Detect and store the default branch (main, master, or other)
+# Detect the default branch (main, master, or other)
 DEFAULT_BRANCH=$(safe_git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
 if [ -z "$DEFAULT_BRANCH" ]; then
   DEFAULT_BRANCH="main"
   echo "  Warning: could not detect default branch, assuming 'main'" >&2
 fi
-echo "$DEFAULT_BRANCH" > "$META_DIR/$REPO_NAME/default-branch"
+
+sudo /usr/local/bin/write-repo-meta "$REPO_NAME" "$REPO" "$DEFAULT_BRANCH"
 
 echo "Added $REPO_NAME"
 ADDREPO
@@ -1927,6 +1976,44 @@ echo 'agent ALL=(root) NOPASSWD: /usr/local/bin/lock-git-config' \
   > /etc/sudoers.d/agent-lock-git-config
 chmod 440 /etc/sudoers.d/agent-lock-git-config
 
+# ── Privileged helper: write repo metadata to root-owned meta/ ──
+# add-repo runs as the agent user, but meta/ is root-owned to prevent
+# sandboxed sessions from tampering with github-path or default-branch.
+# This helper validates inputs and writes the two meta files.
+cat > /usr/local/bin/write-repo-meta << 'WRITEMETA'
+#!/bin/bash
+set -euo pipefail
+REPO_NAME="$1"
+GITHUB_PATH="$2"
+DEFAULT_BRANCH="$3"
+
+# Validate inputs
+if ! [[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "Invalid repo name" >&2; exit 1
+fi
+if ! [[ "$GITHUB_PATH" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+  echo "Invalid github path" >&2; exit 1
+fi
+if ! [[ "$DEFAULT_BRANCH" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+  echo "Invalid branch name" >&2; exit 1
+fi
+
+META_DIR="/home/agent/workspaces/meta/$REPO_NAME"
+mkdir -p "$META_DIR"
+echo "$GITHUB_PATH" > "$META_DIR/github-path"
+echo "$DEFAULT_BRANCH" > "$META_DIR/default-branch"
+chown -R root:agent "$META_DIR"
+chmod 750 "$META_DIR"
+chmod 640 "$META_DIR"/*
+WRITEMETA
+chmod 755 /usr/local/bin/write-repo-meta
+chown root:root /usr/local/bin/write-repo-meta
+
+# Sudoers rule — agent can only run this specific helper as root
+echo 'agent ALL=(root) NOPASSWD: /usr/local/bin/write-repo-meta' \
+  > /etc/sudoers.d/agent-meta
+chmod 440 /etc/sudoers.d/agent-meta
+
 # ── Make pre-sandbox scripts, shared library, and Envoy binary immutable ──
 # These execute outside the sandbox and form part of the trusted computing base.
 # The Envoy binary holds all credentials in memory — a tampered binary could
@@ -1939,6 +2026,7 @@ chattr +i /usr/local/bin/add-repo
 chattr +i /usr/local/bin/refresh-proxy-secrets
 chattr +i /usr/local/bin/rotate-secrets
 chattr +i /usr/local/bin/lock-git-config
+chattr +i /usr/local/bin/write-repo-meta
 chattr +i /usr/local/lib/safe-git.sh
 chattr +i /usr/local/lib/subshell-rc.sh
 
@@ -1956,6 +2044,7 @@ cat > /etc/audit/rules.d/agent.rules << AUDITRULES
 -w /usr/local/bin/refresh-proxy-secrets -p wa -k trusted_scripts
 -w /usr/local/bin/rotate-secrets -p wa -k trusted_scripts
 -w /usr/local/bin/lock-git-config -p wa -k trusted_scripts
+-w /usr/local/bin/write-repo-meta -p wa -k trusted_scripts
 -w /usr/local/lib/safe-git.sh -p wa -k trusted_scripts
 -w /usr/local/lib/subshell-rc.sh -p wa -k trusted_scripts
 -w /usr/local/bin/envoy -p wa -k trusted_scripts
@@ -2051,6 +2140,11 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 mkdir -p /home/agent/logs /home/agent/shared/status
 mkdir -p /home/agent/workspaces/repos /home/agent/workspaces/slots /home/agent/workspaces/meta /home/agent/.locks
 chown -R agent:agent /home/agent/logs /home/agent/shared /home/agent/workspaces /home/agent/.locks
+# meta/ is root-owned to prevent sandboxed sessions from tampering with
+# github-path or default-branch. Agent can read but not write — writes
+# go through the write-repo-meta privileged helper.
+chown root:agent /home/agent/workspaces/meta
+chmod 750 /home/agent/workspaces/meta
 
 # ── Git identity and safety settings for agent user ──
 # All settings are baked into this file and made immutable below.
@@ -2213,6 +2307,13 @@ systemctl enable amazon-cloudwatch-agent
 # ── Start Envoy (after CloudWatch is configured to capture its logs) ──
 systemctl start envoy
 
+# ── Remove unnecessary scheduling tools ──
+# at/batch have no legitimate use in this setup. Removing them eliminates
+# a potential persistence mechanism — even though the sandbox should block
+# access to /var/spool, removing the tools ensures they're unavailable in
+# all contexts, including the post-Claude subshell.
+dnf remove -y at 2>/dev/null || true
+
 # ── Automatic security updates ──
 dnf install -y dnf-automatic
 sed -i 's/apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf
@@ -2236,7 +2337,7 @@ SESSION_LOG="/home/agent/logs/sessions.jsonl"
 # and socat bridge processes persist until the slot is next claimed (when
 # start_bridges does fuser -k). This cleans them up proactively so they
 # don't leak file descriptors and idle connections to Envoy's unix sockets.
-for i in $(seq 1 6); do
+for i in $(seq 1 9); do
   lockfile="$LOCKS_DIR/slot-$i.lock"
   if [ -f "$lockfile" ] && ! (flock -n 200 || exit 1) 200<>"$lockfile" 2>/dev/null; then
     continue  # Slot is active, skip
@@ -2246,7 +2347,7 @@ for i in $(seq 1 6); do
   done
 done
 
-for i in $(seq 1 6); do
+for i in $(seq 1 9); do
   lockfile="$LOCKS_DIR/slot-$i.lock"
   slot_dir="$SLOTS_DIR/slot-$i"
   [ -d "$slot_dir" ] || continue
@@ -2315,7 +2416,42 @@ CLEANUP
 chmod 755 /usr/local/bin/agent-cleanup
 chown root:root /usr/local/bin/agent-cleanup
 chattr +i /usr/local/bin/agent-cleanup
-su - agent -c '(crontab -l 2>/dev/null; echo "0 3 * * 0 /usr/local/bin/agent-cleanup >> /home/agent/logs/cleanup.log 2>&1") | crontab -'
+# System crontab — root-owned so the agent user cannot modify the schedule
+# or redirect the script path. The agent field makes crond run the job as
+# the agent user. Matches the same tamper-proof principle as the script itself.
+cat > /etc/cron.d/agent-cleanup << 'CRON'
+0 3 * * 0 agent /usr/local/bin/agent-cleanup >> /home/agent/logs/cleanup.log 2>&1
+CRON
+chmod 644 /etc/cron.d/agent-cleanup
+chown root:root /etc/cron.d/agent-cleanup
+
+# ── Envoy liveness monitor (pushes CloudWatch metric every 60s) ──
+# Existing alarms (API rate, 403, 5xx) only fire when requests flow through
+# Envoy. If Envoy is completely down (e.g., config corruption after a failed
+# rotation, persistent resource exhaustion, or systemd giving up on restarts),
+# zero requests means zero signal. This cron checks socket liveness and pushes
+# a custom metric so an alarm can fire on total proxy outage.
+cat > /usr/local/bin/envoy-health-check << 'HEALTHCHECK'
+#!/bin/bash
+if socat -u OPEN:/dev/null UNIX-CONNECT:/var/run/envoy/anthropic.sock 2>/dev/null; then
+  VALUE=1
+else
+  VALUE=0
+fi
+aws cloudwatch put-metric-data \
+  --namespace DevServer/Envoy \
+  --metric-name EnvoyHealthy \
+  --value "$VALUE" \
+  --unit Count 2>/dev/null
+HEALTHCHECK
+chmod 755 /usr/local/bin/envoy-health-check
+chown root:root /usr/local/bin/envoy-health-check
+
+cat > /etc/cron.d/envoy-health-check << 'CRON'
+* * * * * root /usr/local/bin/envoy-health-check
+CRON
+chmod 644 /etc/cron.d/envoy-health-check
+chown root:root /etc/cron.d/envoy-health-check
 
 echo "Setup complete $(date)" >> /var/log/agent-setup.log
 ```
@@ -2451,6 +2587,31 @@ Configure SSM to log all terminal sessions to S3, providing an immutable, comple
 6. Name: `dev-high-disk`
 7. **Create alarm**
 
+### Create NAT Gateway Alarm
+
+NAT gateway failure is the one scenario where all 9 agents lose API, GitHub, and package registry access simultaneously (while SSM stays up via VPC endpoints). The Envoy 5xx alarm catches failures for proxied traffic, but package registry connections bypass Envoy — this alarm catches NAT-level issues directly.
+
+1. **Create alarm → Select metric**
+2. **NATGateway → Per NAT Gateway Metrics** → find your NAT gateway ID → select **ErrorPortAllocation** → **Select metric**
+3. Statistic: **Sum**, Period: **5 minutes**
+4. Threshold: **Greater than 0**, Datapoints: **1 out of 1**
+5. Notification: select `dev-alerts`
+6. Name: `dev-nat-port-exhaustion`
+7. **Create alarm**
+
+### Create Envoy Liveness Alarm
+
+The proxy abuse alarms below only fire when requests flow through Envoy. If Envoy is completely down, there are zero requests and zero alarm signal. The `envoy-health-check` cron (installed by the user-data script) pushes an `EnvoyHealthy` metric every 60 seconds — this alarm fires when it reports unhealthy.
+
+1. **Create alarm → Select metric**
+2. **DevServer/Envoy → EnvoyHealthy**
+3. Statistic: **Minimum**, Period: **1 minute**
+4. Threshold: **Less than 1**, Datapoints: **3 out of 3**
+5. Treat missing data as: **Breaching** (if the health check itself stops running, treat as unhealthy)
+6. Notification: select `dev-alerts`
+7. Name: `dev-envoy-down`
+8. **Create alarm**
+
 ### Create Envoy Proxy Abuse Alarms
 
 These metric filters turn Envoy access logs into near-real-time detection of anomalous proxy usage, such as a prompt-injected agent hammering the API or probing blocked paths.
@@ -2472,7 +2633,7 @@ Then create an alarm on this metric:
 1. Go to **CloudWatch → Alarms → Create alarm → Select metric**
 2. **DevServer/Envoy → AnthropicRequestCount**
 3. Statistic: **Sum**, Period: **5 minutes**
-4. Threshold: **Greater than 200** (adjust based on your normal usage — 6 agents at moderate pace)
+4. Threshold: **Greater than 300** (adjust based on your normal usage — 9 agents at moderate pace)
 5. Datapoints to alarm: **2 out of 2**
 6. Notification: select `dev-alerts`
 7. Name: `dev-envoy-high-api-rate`
@@ -2522,7 +2683,7 @@ Then create an alarm:
 7. Name: `dev-envoy-server-errors`
 8. **Create alarm**
 
-> **What these detect:** The API rate alarm catches runaway agents or automated abuse. The 403 alarm catches attempts to access blocked proxy paths — for example, a prompt injection trying to reach the GitHub REST API or Anthropic endpoints beyond `/v1/messages`. A burst of 403s is a strong signal that something is probing the proxy's route restrictions. The 5xx alarm catches infrastructure failures upstream of Envoy — NAT gateway outages, DNS resolution failures, upstream TLS errors, or Envoy misconfiguration. This is the one failure mode where all six agents go down simultaneously while the management plane (SSM) stays up, so proactive alerting is essential.
+> **What these detect:** The API rate alarm catches runaway agents or automated abuse. The 403 alarm catches attempts to access blocked proxy paths — for example, a prompt injection trying to reach the GitHub REST API or Anthropic endpoints beyond `/v1/messages`. A burst of 403s is a strong signal that something is probing the proxy's route restrictions. The 5xx alarm catches infrastructure failures upstream of Envoy — NAT gateway outages, DNS resolution failures, upstream TLS errors, or Envoy misconfiguration. This is the one failure mode where all nine agents go down simultaneously while the management plane (SSM) stays up, so proactive alerting is essential.
 
 ### Create Auditd Security Alarms
 
@@ -2691,7 +2852,7 @@ Git identity and safety settings are configured during instance provisioning (in
 - **`core.fsmonitor = false`** — disables the fsmonitor hook, another git config option that can execute arbitrary commands
 - **`transfer.fsckObjects = true`** — validates incoming git objects during fetch, defending against crafted malicious objects that exploit git's object parsing
 
-> **Defense in depth for git config:** Git local config (per-repo `.git/config`) overrides global config for all settings, including `core.hooksPath`, `core.fsmonitor`, `credential.helper`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, and `diff.external`. Since the sandbox allows writes to the backing repo's `.git/config`, a sandboxed session could re-enable hooks, set a malicious credential helper, askPass, pager, editor, SSH command, or diff program, re-enable fsmonitor, add `insteadOf` / `pushInsteadOf` URL redirection rules, or define custom filter commands that execute during git operations in trusted scripts outside the sandbox. Four layers mitigate this: (1) `add-repo` enables `extensions.worktreeConfig` and makes `.git/config` immutable (`chmod 444` + `chattr +i`), so sandboxed config writes go to a per-worktree file and the shared config cannot be modified, deleted, or replaced; (2) all trusted scripts source a shared `check_git_config_poison()` function from `/usr/local/lib/safe-git.sh` that detects `insteadOf`, `pushInsteadOf`, custom filter commands (with an allowlist for git LFS), and executable config overrides (`core.hooksPath`, `core.fsmonitor`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, `diff.external`, `diff.tool`, `merge.tool`, `sequence.editor`) before any fetch or checkout; (3) all trusted scripts source a shared `safe_git()` wrapper that passes `-c` flags to override all command-executing config keys on every invocation (command-line `-c` flags take precedence over all config levels — `credential.helper` is handled by the runtime override only, not detection, to avoid false positives from legitimate system-level helpers); and (4) repo metadata (`github-path`, `default-branch`) is stored in `~/workspaces/meta/` outside `.git/` to prevent sandbox tampering.
+> **Defense in depth for git config:** Git local config (per-repo `.git/config`) overrides global config for all settings, including `core.hooksPath`, `core.fsmonitor`, `credential.helper`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, and `diff.external`. Since the sandbox allows writes to the backing repo's `.git/config`, a sandboxed session could re-enable hooks, set a malicious credential helper, askPass, pager, editor, SSH command, or diff program, re-enable fsmonitor, add `insteadOf` / `pushInsteadOf` URL redirection rules, or define custom filter commands that execute during git operations in trusted scripts outside the sandbox. Four layers mitigate this: (1) `add-repo` enables `extensions.worktreeConfig` and makes `.git/config` immutable (`chmod 444` + `chattr +i`), so sandboxed config writes go to a per-worktree file and the shared config cannot be modified, deleted, or replaced; (2) all trusted scripts source a shared `check_git_config_poison()` function from `/usr/local/lib/safe-git.sh` that detects `insteadOf`, `pushInsteadOf`, custom filter commands (with an allowlist for git LFS), and executable config overrides (`core.hooksPath`, `core.fsmonitor`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, `diff.external`, `diff.tool`, `merge.tool`, `sequence.editor`) before any fetch or checkout; (3) all trusted scripts source a shared `safe_git()` wrapper that passes `-c` flags to override all command-executing config keys on every invocation (command-line `-c` flags take precedence over all config levels — `credential.helper` is handled by the runtime override only, not detection, to avoid false positives from legitimate system-level helpers); and (4) repo metadata (`github-path`, `default-branch`) is stored in root-owned `~/workspaces/meta/` outside `.git/`, writable only via the `write-repo-meta` privileged helper.
 
 > **To change git identity after launch:** An admin must `ssh dev-admin`, remove the immutable flag (`sudo chattr -i /home/agent/.gitconfig`), edit the file, and re-apply (`sudo chattr +i /home/agent/.gitconfig`).
 
@@ -2699,7 +2860,7 @@ Git identity and safety settings are configured during instance provisioning (in
 
 All git operations route through the Envoy proxy via unix sockets. The `code` and `add-repo` commands create per-session socat bridges from localhost TCP ports to the Envoy unix socket, and Envoy injects the GitHub PAT automatically. No credential helper needed, no token in the environment.
 
-The `add-repo` command clones via a temporary socat bridge. The `code` command starts per-slot bridges on deterministic ports (8091–8096 for git) and overrides the remote URL via `GIT_CONFIG` environment variables, scoped to the session's process tree. This avoids mutating the shared `.git/config` and eliminates remote URL races when two slots work on the same repo.
+The `add-repo` command clones via a temporary socat bridge. The `code` command starts per-slot bridges on deterministic ports (8091–8099 for git) and overrides the remote URL via `GIT_CONFIG` environment variables, scoped to the session's process tree. This avoids mutating the shared `.git/config` and eliminates remote URL races when two slots work on the same repo.
 
 > **Note:** The GitHub proxy only forwards git smart-HTTP paths (`*.git/info/refs`, `*.git/git-upload-pack`, `*.git/git-receive-pack`). All other paths return `403 Forbidden`. This prevents a prompt injection from using the proxy to call the GitHub REST API (e.g., to create webhooks, modify settings, or read data beyond what git operations expose).
 
@@ -2790,12 +2951,19 @@ git config --worktree user.name "test"
 git config --worktree --unset user.name
 # Both should succeed (writes to .git/worktrees/slot-N/config.worktree)
 
-# 5. Test if the meta directory is writable from inside the sandbox:
+# 5. Verify that the meta directory is not writable (root-owned):
 echo "test" > ~/workspaces/meta/yourrepo/test-write
-# This SHOULD fail with Permission denied. If it succeeds, the sandbox
-# is not confining writes to the worktree — see remediation below.
-# 6. If step 5 failed (expected), no cleanup needed. If it succeeded:
-rm -f ~/workspaces/meta/yourrepo/test-write
+# Should fail with Permission denied — meta/ is owned by root:agent with
+# mode 750, so the agent user can read but not write. This is enforced by
+# filesystem permissions regardless of sandbox confinement.
+
+# 6. Verify that scheduling tools are blocked inside the sandbox:
+echo "* * * * * id > /tmp/test" | crontab -
+# Should fail — the sandbox confines writes to the worktree, so writes to
+# /var/spool/cron/crontabs/ are blocked. If this succeeds, a sandboxed
+# session could schedule commands that execute outside the sandbox with
+# full NAT gateway access. Fix by removing the at/cron packages or adding
+# these binaries to a denied list.
 ```
 
 If the `.git/config` write in step 3 succeeds despite the immutable flag (e.g., filesystem doesn't support extended attributes), escalate to making the backing `.git/config` owned by root and re-applying the immutable flag:
@@ -2807,59 +2975,18 @@ sudo chmod 444 /home/agent/workspaces/repos/REPO_NAME/.git/config
 sudo chattr +i /home/agent/workspaces/repos/REPO_NAME/.git/config
 ```
 
-If `meta/` is writable from inside the sandbox (step 5 succeeded), the `validate_github_path()` cross-validation catches the high-severity case (`github-path` tampering that redirects authenticated git operations). The residual risk is `default-branch` tampering, which can cause a session to start from the wrong branch of the correct repo — see Accepted Tradeoffs. To close this gap fully, make `meta/` root-owned and use a privileged helper for writes:
+The `meta/` directory is root-owned by default. The `write-repo-meta` privileged helper (created in the user-data script alongside `lock-git-config`) handles all writes — `add-repo` calls it via `sudo`. This prevents sandboxed sessions from tampering with `github-path` or `default-branch`. The `validate_github_path()` cross-validation provides an additional layer for the high-severity case (`github-path` tampering that redirects authenticated git operations).
+
+If you're upgrading an existing installation where `meta/` was previously agent-owned, lock it down manually:
 
 ```bash
 ssh dev-admin
 
-# Lock down meta/ directory
 sudo chown -R root:agent /home/agent/workspaces/meta
 sudo chmod 750 /home/agent/workspaces/meta
-# Existing repo subdirs need the same treatment:
 sudo find /home/agent/workspaces/meta -type d -exec chmod 750 {} \;
 sudo find /home/agent/workspaces/meta -type f -exec chmod 640 {} \;
 ```
-
-Then create `/usr/local/bin/write-repo-meta` — a root-owned helper that validates inputs and writes the two meta files:
-
-```bash
-cat > /usr/local/bin/write-repo-meta << 'WRITEMETA'
-#!/bin/bash
-set -euo pipefail
-REPO_NAME="$1"
-GITHUB_PATH="$2"
-DEFAULT_BRANCH="$3"
-
-# Validate inputs
-if ! [[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-  echo "Invalid repo name" >&2; exit 1
-fi
-if ! [[ "$GITHUB_PATH" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
-  echo "Invalid github path" >&2; exit 1
-fi
-if ! [[ "$DEFAULT_BRANCH" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
-  echo "Invalid branch name" >&2; exit 1
-fi
-
-META_DIR="/home/agent/workspaces/meta/$REPO_NAME"
-mkdir -p "$META_DIR"
-echo "$GITHUB_PATH" > "$META_DIR/github-path"
-echo "$DEFAULT_BRANCH" > "$META_DIR/default-branch"
-chown -R root:agent "$META_DIR"
-chmod 750 "$META_DIR"
-chmod 640 "$META_DIR"/*
-WRITEMETA
-chmod 755 /usr/local/bin/write-repo-meta
-chown root:root /usr/local/bin/write-repo-meta
-chattr +i /usr/local/bin/write-repo-meta
-
-# Sudoers rule — agent can only run this specific helper as root
-echo 'agent ALL=(root) NOPASSWD: /usr/local/bin/write-repo-meta' \
-  > /etc/sudoers.d/agent-meta
-chmod 440 /etc/sudoers.d/agent-meta
-```
-
-Then update `add-repo` to call `sudo write-repo-meta "$REPO_NAME" "$REPO" "$DEFAULT_BRANCH"` instead of writing directly to `meta/`. This is optional — only needed if the sandbox allows meta/ writes and your risk tolerance requires closing the `default-branch` tampering gap.
 
 ### Verify IMDS Is Blocked for Agent
 
@@ -2932,7 +3059,7 @@ cat /var/log/envoy/envoy.log
 
 ```bash
 ssh dev-admin
-lsattr /usr/local/bin/envoy /usr/local/bin/code /usr/local/bin/add-repo /usr/local/bin/refresh-proxy-secrets /usr/local/bin/rotate-secrets /usr/local/bin/lock-git-config /usr/local/lib/safe-git.sh /usr/local/lib/subshell-rc.sh
+lsattr /usr/local/bin/envoy /usr/local/bin/code /usr/local/bin/add-repo /usr/local/bin/refresh-proxy-secrets /usr/local/bin/rotate-secrets /usr/local/bin/lock-git-config /usr/local/bin/write-repo-meta /usr/local/lib/safe-git.sh /usr/local/lib/subshell-rc.sh
 # All should show: ----i--- (immutable flag set)
 ```
 
@@ -3207,7 +3334,7 @@ lsattr /home/agent/.gitconfig
 # Should show: ----i--- (immutable flag set)
 
 # Verify trusted scripts are intact:
-lsattr /usr/local/bin/envoy /usr/local/bin/code /usr/local/bin/add-repo /usr/local/bin/refresh-proxy-secrets /usr/local/bin/rotate-secrets /usr/local/bin/agent-cleanup /usr/local/bin/lock-git-config /usr/local/lib/safe-git.sh /usr/local/lib/subshell-rc.sh
+lsattr /usr/local/bin/envoy /usr/local/bin/code /usr/local/bin/add-repo /usr/local/bin/refresh-proxy-secrets /usr/local/bin/rotate-secrets /usr/local/bin/agent-cleanup /usr/local/bin/lock-git-config /usr/local/bin/write-repo-meta /usr/local/lib/safe-git.sh /usr/local/lib/subshell-rc.sh
 # All should show: ----i--- (immutable flag set)
 
 # Verify Envoy sockets exist with correct permissions:
@@ -3281,19 +3408,19 @@ sudo chattr +i /home/agent/.ssh/authorized_keys /home/admin/.ssh/authorized_keys
 - **Envoy log rotation prevents disk exhaustion.** Local Envoy access logs are rotated daily with 7-day retention via logrotate (`copytruncate` avoids needing to signal Envoy for log reopening). CloudWatch retains the canonical immutable copy for 30 days.
 - **Anthropic API proxy path-scoped.** Envoy only forwards requests matching `/v1/messages*` to the Anthropic API. All other paths return `403 Forbidden`. This prevents an agent or prompt injection from using the proxy to access Anthropic account management, key creation, or billing endpoints even if the API key has those permissions.
 - **Anthropic API timeouts accommodate extended thinking.** The Anthropic proxy listener uses 600-second timeouts for both `stream_idle_timeout` and `request_timeout`, matching the GitHub listener. This provides headroom for Claude Code sessions using extended thinking, where streaming responses may have long pauses between chunks during complex reasoning.
-- **Pre-sandbox scripts and Envoy binary are immutable and audited.** All scripts that execute outside the sandbox (`code`, `add-repo`, `refresh-proxy-secrets`, `rotate-secrets`, `agent-cleanup`), privileged helpers (`lock-git-config`), the shared libraries (`/usr/local/lib/safe-git.sh`, `/usr/local/lib/subshell-rc.sh`), and the Envoy binary (`/usr/local/bin/envoy`) are root-owned and protected with `chattr +i`. This prevents modification even if an attacker gains write access as root — they would need to explicitly `chattr -i` first. All modification attempts are logged by auditd via the `trusted_scripts` key.
+- **Pre-sandbox scripts and Envoy binary are immutable and audited.** All scripts that execute outside the sandbox (`code`, `add-repo`, `refresh-proxy-secrets`, `rotate-secrets`, `agent-cleanup`), privileged helpers (`lock-git-config`, `write-repo-meta`), the shared libraries (`/usr/local/lib/safe-git.sh`, `/usr/local/lib/subshell-rc.sh`), and the Envoy binary (`/usr/local/bin/envoy`) are root-owned and protected with `chattr +i`. This prevents modification even if an attacker gains write access as root — they would need to explicitly `chattr -i` first. All modification attempts are logged by auditd via the `trusted_scripts` key.
 - **Per-slot session logging for incident correlation.** Each `code` session writes structured JSON events (start/stop with slot number, bridge ports, repo, branch, PID, and timestamp) to `~/logs/sessions.jsonl`. This log ships to CloudWatch (`/agent/session-events`) and enables correlating Envoy access log entries with specific Claude Code sessions by matching timestamps to each slot's active time window and bridge port assignments.
 - **Request-level access logging with anomaly detection.** Both the Anthropic and GitHub proxy listeners log every request in structured JSON format (timestamp, method, path, response code, bytes sent/received, duration, downstream remote address). Logs ship to CloudWatch for immutable retention. CloudWatch metric filters and alarms detect anomalous patterns in near-real-time: sustained high API request rates trigger `dev-envoy-high-api-rate`, and bursts of 403 responses (blocked path probing) trigger `dev-envoy-forbidden-spike`. Both alert via SNS email.
 - **Full terminal session recording.** SSM session logging captures the complete terminal stream (all input and output) for every SSH session and writes it to S3 with bucket versioning enabled (immutable). Combined with Envoy access logs and auditd, this provides four independent audit layers: commands executed (auditd), terminal I/O (SSM session logs), API calls made (Envoy access logs), and code changes (git history).
 - **Git hooks, fsmonitor, credential helper, pager, editor, and other executable config keys neutralized via two independent layers.** The agent user's `~/.gitconfig` sets `core.hooksPath = /dev/null` and `core.fsmonitor = false`, and is protected with `chattr +i`. However, git local config (per-repo `.git/config`) overrides global config, so a malicious repo or sandboxed session could potentially re-enable hooks, set a malicious credential helper, pager, editor, or diff program via per-repo config. Three layers prevent this: (1) `add-repo` makes `.git/config` immutable (`chmod 444` + `chattr +i`) and enables `extensions.worktreeConfig` so sandboxed config writes go to a per-worktree file; (2) `check_git_config_poison()` detects known poisoning patterns (including executable config overrides like `core.hooksPath`, `core.fsmonitor`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, `diff.external`, `diff.tool`, `merge.tool`, `sequence.editor` — `credential.helper` is intentionally omitted from detection to avoid false positives from legitimate system-level helpers, but is cleared by the runtime override) before any fetch or checkout; and (3) all trusted scripts source a shared `safe_git()` wrapper from `/usr/local/lib/safe-git.sh` (root-owned, immutable) that passes `-c` flags to override all command-executing config keys on every invocation. Command-line `-c` flags take precedence over all config levels (local, global, system), making each call immune to per-repo config overrides.
 - **Git `url.*.insteadOf`, `pushInsteadOf`, and custom filter commands detected before fetch.** Per-repo `.git/config` can set `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` rules that silently redirect git fetch or push URLs to an attacker-controlled endpoint, bypassing Envoy. Custom filter commands (`filter.*.clean`, `filter.*.smudge`, `filter.*.process`) execute during `checkout`, `reset --hard`, and `clean` — operations that trusted scripts run outside the sandbox with outbound HTTPS available. Unlike `hooksPath` and `fsmonitor`, these can't be blanket-overridden with a single `-c` flag because the keys include variable names. The shared `check_git_config_poison()` function in `safe-git.sh` detects all three families before any fetch, checkout, or reset. Git LFS entries are allowlisted only if both the key prefix (`filter.lfs.*`) and the value prefix (`git-lfs `) match — preventing an attacker from keeping the LFS key name while substituting a malicious command. The check runs against the backing repo config before the first fetch (preventing `insteadOf` from taking effect during the fetch itself) and again against the worktree config as a second pass.
 - **Backing repo `.git/config` is immutable.** The `add-repo` script enables `extensions.worktreeConfig` and makes `.git/config` immutable (`chmod 444` + `chattr +i`) after cloning. This redirects `git config --worktree` writes to a per-worktree `config.worktree` file (under `.git/worktrees/<slot>/`) while preventing any modification, deletion, or replacement of the shared config. Mode `0444` alone would be insufficient — `unlink()` checks the parent directory's write permission, and the sandbox allows writes to `.git/`. The `chattr +i` flag prevents deletion regardless of parent directory permissions. This is the primary control against config poisoning — the detection checks in `check_git_config_poison()` serve as defense-in-depth.
-- **Repo metadata stored outside `.git/` with cross-validation against frozen config.** The `github-path` and `default-branch` files that trusted scripts use to construct remote URLs and determine the default branch are stored in `~/workspaces/meta/REPO_NAME/`, not in the repo's `.git/` directory. This prevents a sandboxed session from modifying these files to redirect subsequent sessions to a different repository or branch. As an additional safeguard, `validate_github_path()` in `safe-git.sh` cross-validates the `meta/github-path` value against the org/repo path embedded in the frozen `.git/config` remote URL (which is read-only) before any authenticated git operation. If the paths diverge, the script aborts — preventing meta-directory tampering from redirecting fetches and pushes to an attacker-controlled repo even if the sandbox allows writes to `meta/`.
+- **Repo metadata stored outside `.git/` in root-owned directory with cross-validation.** The `github-path` and `default-branch` files that trusted scripts use to construct remote URLs and determine the default branch are stored in `~/workspaces/meta/REPO_NAME/` (owned by `root:agent`, mode `750`), not in the repo's `.git/` directory. The `meta/` directory is not writable by the agent user — writes go through the `write-repo-meta` privileged helper, which validates inputs and sets ownership. This prevents a sandboxed session from modifying these files to redirect subsequent sessions to a different repository or branch. As an additional safeguard, `validate_github_path()` in `safe-git.sh` cross-validates the `meta/github-path` value against the org/repo path embedded in the frozen `.git/config` remote URL (which is read-only) before any authenticated git operation. If the paths diverge, the script aborts.
 - **Git push safety baked into immutable config.** The agent user's `~/.gitconfig` includes `branch.main.pushRemote = no_push` and `branch.master.pushRemote = no_push`, preventing accidental direct pushes to protected branches. These settings are protected by the same `chattr +i` flag that protects `core.hooksPath`, so they cannot be overridden by a prompt injection.
 - **Git object integrity verified on fetch.** `transfer.fsckObjects = true` in the immutable `~/.gitconfig` validates incoming git objects during fetch, defending against crafted malicious objects that exploit git's object parsing. This adds negligible overhead and catches corrupted or adversarial objects before they enter the local repository.
 - **Git protocol restricted to HTTP only.** `GIT_ALLOW_PROTOCOL=http` is exported by the shared `safe-git.sh` library, blocking git's `ext::` transport (which allows arbitrary command execution via remote URLs), as well as `ssh://`, `file://`, and `git://` protocols. All legitimate git operations in this setup use plain HTTP to localhost socat bridges, so no other protocol is needed. This eliminates the entire class of protocol-based command execution attacks — including via `.gitmodules` submodule URLs and crafted refs — regardless of config or sandbox state.
 - **Git hangs prevented on credential failure.** `GIT_TERMINAL_PROMPT=0` is exported by the shared `safe-git.sh` library, which is sourced by every script that runs git operations (`code`, `add-repo`, `agent-cleanup`). If a socat bridge dies and git falls back to interactive credential prompting, it fails fast with a clear error instead of hanging the session silently.
-- **Post-Claude subshell hardened against config poisoning.** The subshell that runs after Claude exits (for manual review and `git push`) operates outside the sandbox with outbound HTTPS available via the NAT gateway. Two protections prevent a sandboxed Claude session from planting config poison (e.g., `pushInsteadOf` in `config.worktree`) that would take effect in the subshell: (1) `check_git_config_poison()` re-runs against the worktree after Claude exits, aborting without a subshell if poison is detected; (2) the subshell loads `/usr/local/lib/subshell-rc.sh` (root-owned, immutable) which aliases `git` to `safe_git`, applying the same `-c` flag overrides that trusted scripts use. This neutralizes `credential.helper`, `core.askPass`, `core.hooksPath`, `core.sshCommand`, and `core.fsmonitor` even in interactive use.
+- **Post-Claude subshell hardened against config poisoning.** The subshell that runs after Claude exits (for manual review and `git push`) operates outside the sandbox with outbound HTTPS available via the NAT gateway. Three protections prevent a sandboxed Claude session from planting config poison (e.g., `pushInsteadOf`, malicious aliases, `http.proxy` in `config.worktree`) that would take effect in the subshell: (1) `config.worktree` is unconditionally deleted after Claude exits — no legitimate worktree-specific config is needed, so this is a generic defense that closes all config-based attack vectors without needing to enumerate them; (2) `check_git_config_poison()` re-runs as a safety net in case the delete somehow failed; (3) the subshell loads `/usr/local/lib/subshell-rc.sh` (root-owned, immutable) which aliases `git` to `safe_git`, applying the same `-c` flag overrides that trusted scripts use. This neutralizes `credential.helper`, `core.askPass`, `core.hooksPath`, `core.sshCommand`, and `core.fsmonitor` even in interactive use.
 - **PAT scoped to specific repos.** The GitHub fine-grained PAT only has access to the repos you explicitly selected. A compromised token cannot access other repos in your org.
 - **Server-side branch protection.** Cannot be bypassed by anything on the dev server.
 - **CI/CD hardening guidance included.** See section 11 for required CI pipeline mitigations to prevent prompt-injected agents from committing malicious workflow files to feature branches.
@@ -3306,36 +3433,37 @@ sudo chattr +i /home/agent/.ssh/authorized_keys /home/admin/.ssh/authorized_keys
 - **Atomic slot locking via flock.** Slots are locked using kernel-level `flock` on file descriptors. The lock is automatically released when the shell process exits, regardless of how it exits (normal, signal, crash). No stale-lock detection needed — impossible to have orphaned locks.
 - **Inter-agent visibility without coordination risk.** Agents can see what other slots are working on via status files, but cannot send instructions to each other.
 - **Zero-downtime secret rotation.** `rotate-secrets` fetches fresh credentials from Secrets Manager, validates the generated config, and restarts Envoy. Active Claude Code sessions continue working — their socat bridges automatically reconnect to the new Envoy sockets, and subsequent requests use the new credentials. If config validation fails, the previous working config is restored from backup.
-- **Cleanup script is tamper-proof and self-healing.** The weekly cleanup cron runs as the agent user but executes a root-owned, immutable script (`/usr/local/bin/agent-cleanup`). A prompt injection cannot modify the script to execute arbitrary code outside the sandbox on the next cron run. If the cleanup detects a poisoned worktree `config.worktree`, it quarantines the file (renamed with a `.quarantined.<timestamp>` suffix for forensic review) and proceeds with normal slot reset, preventing poisoned slots from becoming permanently stuck.
+- **Cleanup script and schedule are tamper-proof.** The weekly cleanup runs via a root-owned system crontab (`/etc/cron.d/agent-cleanup`) that executes a root-owned, immutable script (`/usr/local/bin/agent-cleanup`) as the agent user. Both the scheduling entry and the script are outside the agent's control — the agent cannot modify the schedule, redirect the script path, or alter the script itself. If the cleanup detects a poisoned worktree `config.worktree`, it quarantines the file (renamed with a `.quarantined.<timestamp>` suffix for forensic review) and proceeds with normal slot reset, preventing poisoned slots from becoming permanently stuck.
 
 ### Accepted Tradeoffs
 
 - **Outbound HTTPS unrestricted at the security group level.** The VPC security group allows port 443 to any destination. However, the sandbox network policy restricts agent processes to `127.0.0.1` only — all outbound HTTPS must go through per-slot socat bridges to Envoy's unix sockets, and Envoy currently proxies only Anthropic and GitHub. A next hardening step is to add domain allowlisting in Envoy to restrict which upstream hosts it will forward to.
 - **Public package registries are reachable but are potential exfiltration channels.** The sandbox allows direct HTTPS access to `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `index.crates.io`, `static.crates.io`, `crates.io`, and `soldeer.xyz`. This lets `npm install`, `pip install`, `cargo build`, and `forge soldeer install` work inside the sandbox. However, a prompt injection could encode data in package name lookups or request metadata to these domains. VPC flow logs capture the connections but not the content. This is an accepted tradeoff: blocking registries would break Claude Code's ability to install dependencies, which is a core part of its workflow.
-- **Private registries route through Envoy for credential injection.** If `NPM_PRIVATE_TOKEN` is set in Secrets Manager, Envoy proxies and authenticates requests to the private registry (default: `npm.pkg.github.com`, configurable via `NPM_PRIVATE_REGISTRY`). The same architecture applies to other private registries — add additional tokens, listeners, and clusters following the same pattern. Private registry traffic is logged in Envoy access logs alongside API and git traffic. Configure your repo's `.npmrc` to point scoped packages at the per-slot bridge URL using the `NPM_PRIVATE_REGISTRY_URL` environment variable exported by the `code` script (npm supports `${VAR}` interpolation in `.npmrc`). You must also add `_authToken` entries for all six slot ports (8101–8106) — npm requires auth config per registry URL, but the token value is irrelevant ("dummy" is fine) because Envoy strips the inbound `Authorization` header and injects the real token. Do not put real tokens in `.npmrc`. See the full `.npmrc` example in the `code` script comments.
-- **No request-rate cap on the Anthropic proxy.** The CloudWatch alarm detects sustained high API request rates but is reactive — it fires after two consecutive 5-minute periods above the threshold, during which a runaway agent could accumulate significant spend. The Anthropic Console spend cap provides an outer bound but operates on a monthly timescale. For a preventive control, Envoy's `envoy.filters.http.local_ratelimit` can enforce a per-listener requests-per-second cap (e.g., 3 req/s would accommodate 6 agents comfortably while capping worst-case burst spend). This is a straightforward follow-up hardening step.
+- **Private registries route through Envoy for credential injection.** If `NPM_PRIVATE_TOKEN` is set in Secrets Manager, Envoy proxies and authenticates requests to the private registry (default: `npm.pkg.github.com`, configurable via `NPM_PRIVATE_REGISTRY`). The same architecture applies to other private registries — add additional tokens, listeners, and clusters following the same pattern. Private registry traffic is logged in Envoy access logs alongside API and git traffic. Configure your repo's `.npmrc` to point scoped packages at the per-slot bridge URL using the `NPM_PRIVATE_REGISTRY_URL` environment variable exported by the `code` script (npm supports `${VAR}` interpolation in `.npmrc`). You must also add `_authToken` entries for all nine slot ports (8101–8109) — npm requires auth config per registry URL, but the token value is irrelevant ("dummy" is fine) because Envoy strips the inbound `Authorization` header and injects the real token. Do not put real tokens in `.npmrc`. See the full `.npmrc` example in the `code` script comments.
+- **No request-rate cap on the Anthropic proxy.** The CloudWatch alarm detects sustained high API request rates but is reactive — it fires after two consecutive 5-minute periods above the threshold, during which a runaway agent could accumulate significant spend. The Anthropic Console spend cap provides an outer bound but operates on a monthly timescale. For a preventive control, Envoy's `envoy.filters.http.local_ratelimit` can enforce a per-listener requests-per-second cap (e.g., 5 req/s would accommodate 9 agents comfortably while capping worst-case burst spend). This is a straightforward follow-up hardening step.
 - **Admin user is root-equivalent.** Intentional for maintenance. Mitigated by separate SSH key, separate user, YubiKey required, audit logging.
 - **Agent can discover the proxy architecture.** An agent running `curl localhost:8081` (if a socat bridge for their slot happens to use that port) can confirm a proxy exists. With the sandbox active, these localhost requests are permitted since `127.0.0.1` is in the allowed domains list. The agent cannot extract credentials: the admin interface is on a unix socket inaccessible to the agent user, the Anthropic proxy only forwards `/v1/messages*` paths, and the GitHub proxy only forwards git smart-HTTP paths (all others return 403). However, the agent could attempt to use the proxy to make authenticated API calls to the allowed paths. Mitigate by using an API key scoped to only the permissions Claude Code needs.
 - **Brief interruption during secret rotation.** Restarting Envoy causes a brief (<1s) window where the proxy is unavailable. Active Claude Code sessions' socat bridges will fail to connect during this window; retries will succeed once the new Envoy sockets are created. For true zero-downtime rotation, Envoy's hot restart mechanism can be configured.
-- **socat bridges add a process per listener per slot.** Each active slot runs two socat bridge processes (one for Anthropic, one for GitHub). At full capacity (6 slots), this is 12 socat processes — negligible resource overhead but additional processes to manage. Bridges are cleaned up automatically when the session exits via the trap handler. If the trap doesn't fire (SIGKILL, OOM), orphaned bridges persist until the slot is next claimed (`start_bridges` does `fuser -k`) or until the weekly `agent-cleanup` cron kills them.
+- **socat bridges add a process per listener per slot.** Each active slot runs two socat bridge processes (one for Anthropic, one for GitHub). At full capacity (9 slots), this is 18 socat processes — negligible resource overhead but additional processes to manage. Bridges are cleaned up automatically when the session exits via the trap handler. If the trap doesn't fire (SIGKILL, OOM), orphaned bridges persist until the slot is next claimed (`start_bridges` does `fuser -k`) or until the weekly `agent-cleanup` cron kills them.
 - **No container isolation.** Agents run as the same user (`agent`) in separate SSH sessions. They share the same kernel, network namespace, and can see each other's processes via `/proc`. The sandbox mitigates this significantly: each session's bash commands are confined to their own worktree directory. `/proc/PID/environ` reveals only a format-passing dummy key (`sk-ant-proxy00-...`) — not real credentials.
 - **PAT is longer-lived than GitHub App tokens.** The PAT expires every 90 days instead of every hour. If compromised (via the proxy, since it's not in the environment), it provides access until manually revoked or until expiry. Mitigated by: scoping to specific repos, storing only in Secrets Manager and Envoy config, never in agent-accessible files.
 - **`code sync` and session start remove all untracked files.** Both `code sync` (for idle slots) and every new `code` session (before branch checkout) run `git clean -fdx`, which removes `node_modules`, build caches, and other expensive-to-recreate artifacts. The next session pays a cold-start penalty reinstalling dependencies. This is the correct tradeoff: a prompt injection can leave behind untracked files (e.g., `CLAUDE.md`, `.env`, `.npmrc`, `Makefile`) designed to influence future sessions, and a clean slot should mean clean.
 - **Shared git object database.** All worktrees for a given repo share the same `.git` directory. A corrupt git operation in one worktree could theoretically affect others. The shared `.git/config` is immutable (`chattr +i`) with `extensions.worktreeConfig` enabled, so per-slot config goes to worktree-specific files, but refs, objects, and index are still shared.
 - **Agent logs are mutable locally.** The agent can delete files in `~/logs/`. The CloudWatch copy is immutable. SSM session recordings in S3 are versioned and immutable.
-- **Agents share a GitHub PAT.** All 6 agents use the same token with the same permissions. There is no per-agent credential scoping. This is simpler than per-slot tokens but means you cannot revoke access for a single slot without affecting all of them.
-- **Envoy is a single point of failure.** If Envoy crashes, all 6 agent sessions lose API and GitHub access (their socat bridges will fail to connect to the unix sockets). Mitigated by `Restart=always` in the systemd unit (auto-recovery in ~5 seconds) and the Envoy readiness check in the `code` launcher. Socat bridges will reconnect to the new sockets automatically on the next request.
+- **Agents share a GitHub PAT.** All 9 agents use the same token with the same permissions. There is no per-agent credential scoping. This is simpler than per-slot tokens but means you cannot revoke access for a single slot without affecting all of them.
+- **Envoy is a single point of failure.** If Envoy crashes, all 9 agent sessions lose API and GitHub access (their socat bridges will fail to connect to the unix sockets). Mitigated by `Restart=always` in the systemd unit (auto-recovery in ~5 seconds), the Envoy readiness check in the `code` launcher, and the `envoy-health-check` cron that pushes a liveness metric to CloudWatch every 60 seconds (with an alarm on prolonged failure). Socat bridges will reconnect to the new sockets automatically on the next request.
 - **Sandbox adds minor overhead.** bubblewrap introduces minimal latency on filesystem operations. In practice this is not measurable for typical development workflows.
 - **Sandbox config requires admin to modify.** Because `~/.claude/settings.json` is root-owned and immutable, the agent user cannot adjust sandbox settings (e.g., to allow a new domain or path). This is intentional — sandbox configuration changes require an admin SSH session.
 - **Git hooks globally disabled for agent, with per-invocation enforcement in trusted scripts.** The agent user cannot use legitimate git hooks (pre-commit linters, etc.) due to `core.hooksPath = /dev/null` in the immutable global gitconfig. Additionally, all trusted scripts enforce `-c` overrides for all command-executing config keys (`core.hooksPath`, `core.fsmonitor`, `credential.helper`, `core.askPass`, `core.pager`, `core.editor`, `core.sshCommand`, `diff.external`) on every git invocation via a shared `safe_git()` wrapper sourced from `/usr/local/lib/safe-git.sh`, which overrides any per-repo config. Custom filter commands and executable config overrides are detected by `check_git_config_poison()` before any fetch, checkout, or reset, with an allowlist for git LFS (`filter.lfs.*`). If you need hooks, replace `/dev/null` with a directory containing only vetted hook scripts (owned by root and immutable), and update the shared `safe_git()` wrapper to point to the same directory. If you need custom filters beyond LFS, add them to the allowlist in `check_git_config_poison()`.
 - **Agent gitconfig is immutable.** The agent cannot change any git configuration set in `~/.gitconfig` (including `core.hooksPath`, `core.fsmonitor`, `user.name`, `user.email`, and push safety settings). The backing repo's `.git/config` is also immutable (`chattr +i`). Per-worktree `config.worktree` settings work for non-security-sensitive options, but trusted scripts override security-sensitive settings via command-line `-c` flags which take precedence over all config levels.
+- **Git submodules are unsupported.** `GIT_ALLOW_PROTOCOL=http` blocks `https://`, and submodule URLs in `.gitmodules` are almost universally `https://github.com/...`. Even without the protocol restriction, the sandbox blocks direct outbound to `github.com`, so submodule fetches would fail regardless. A workaround exists (adding `url.<bridge>.insteadOf=https://github.com/` via `GIT_CONFIG` env vars to route submodule fetches through the Envoy bridge), but it requires per-organization entries and conflicts with `check_git_config_poison()` which flags `insteadOf` — distinguishing environment-level from config-file-level rewrites would add complexity for a marginal use case. If your repos use submodules, clone them with `--recurse-submodules` on your local machine and push the populated tree, or restructure to use package managers instead.
 - **SSM session logs add storage costs.** Terminal recordings can be verbose, especially for long Claude Code sessions. Mitigated by the S3 lifecycle rule (Glacier after 90 days, expiry after 365 days). Expect roughly 1–10 MB per session depending on output volume.
-- **Updating immutable files requires admin access.** To modify any of the trusted scripts (`code`, `add-repo`, `refresh-proxy-secrets`, `rotate-secrets`, `agent-cleanup`), privileged helpers (`lock-git-config`), the shared libraries (`/usr/local/lib/safe-git.sh`, `/usr/local/lib/subshell-rc.sh`), or the Envoy binary (`/usr/local/bin/envoy`), an admin must first `sudo chattr -i /path/to/file`, make the change, and re-apply `sudo chattr +i`. This is intentional friction — changes to the trusted computing base should be deliberate and auditable. See section 12 for the Envoy update procedure. To remove the immutable flag on a backing repo's `.git/config` (e.g., for one-time config changes), an admin must `sudo chattr -i` the file and re-apply after the change.
+- **Updating immutable files requires admin access.** To modify any of the trusted scripts (`code`, `add-repo`, `refresh-proxy-secrets`, `rotate-secrets`, `agent-cleanup`), privileged helpers (`lock-git-config`, `write-repo-meta`), the shared libraries (`/usr/local/lib/safe-git.sh`, `/usr/local/lib/subshell-rc.sh`), or the Envoy binary (`/usr/local/bin/envoy`), an admin must first `sudo chattr -i /path/to/file`, make the change, and re-apply `sudo chattr +i`. This is intentional friction — changes to the trusted computing base should be deliberate and auditable. See section 12 for the Envoy update procedure. To remove the immutable flag on a backing repo's `.git/config` (e.g., for one-time config changes), an admin must `sudo chattr -i` the file and re-apply after the change.
 - **Per-slot session correlation is timestamp-based.** Envoy access logs don't contain a slot identifier directly. Correlation requires matching Envoy log timestamps against the start/stop events in `sessions.jsonl` to determine which slot was active on which bridge port at that time. This is straightforward for post-hoc analysis but not instant — for real-time per-slot monitoring, consider adding per-slot Envoy listeners in a future hardening step.
 - **Git remote URLs overridden via environment or `-c` flag, not config.** Each `code` session sets the remote URL via `GIT_CONFIG` environment variables rather than mutating `.git/config`. `code sync` and `add-repo` pass the URL via `-c remote.origin.url=...` on the fetch command. This avoids writes to the immutable `.git/config`, eliminates races when two slots work on the same repo (each session's env vars are independent), and eliminates stale remote URLs in idle slots (the persisted config is never touched).
 - **Event-driven local sync only catches agent pushes.** The `watch-pushes` script tails the Envoy GitHub access log, so it only sees pushes that go through the EC2 server's proxy. Pushes from your MacBook, teammate pushes, and GitHub PR merges are invisible to it. The script does a catch-up `fetch --all` on each reconnect, which partially compensates. For complete coverage of all push sources, use polling (`ls-remote` at 15-second intervals) instead of or in addition to the event-driven approach.
 - **Sandbox allows writes to backing `.git/` directories.** Git worktrees need write access to the backing repo's `.git/` directory (at `~/workspaces/repos/REPO/.git/`) for normal operations (updating refs, index, objects). The sandbox does not block these writes, which means a sandboxed session could attempt to poison the shared `.git/config`. Three layers mitigate this: (1) `add-repo` enables `extensions.worktreeConfig` and makes `.git/config` immutable (`chmod 444` + `chattr +i`), preventing modification, deletion, or replacement of the shared config; (2) the shared `check_git_config_poison()` function detects `insteadOf`, `pushInsteadOf`, and custom filter commands (with a git LFS allowlist) before any fetch, checkout, or reset in trusted scripts; (3) the `safe_git()` wrapper overrides `core.hooksPath`, `core.fsmonitor`, `credential.helper`, `core.askPass`, `core.sshCommand`, and `diff.external` on every invocation. If a future git config directive introduces a new code execution vector not covered by the detection, the immutable `.git/config` is the primary control that blocks it generically.
-- **`meta/default-branch` is writable if sandbox allows `meta/` writes.** The `validate_github_path()` cross-validation protects `github-path` (the high-severity field that controls where authenticated git operations are directed) by comparing it against the frozen `.git/config` remote URL. However, `default-branch` is not cross-validated — there is no equivalent frozen reference. If a sandboxed session can write to `~/workspaces/meta/`, tampering with `default-branch` could cause the next session to check out the wrong starting branch of the correct repo. This does not cross a security boundary (no credential redirection, no exfiltration path), but could cause an agent to work from an unexpected base. To close this gap, make `meta/` root-owned and use the `write-repo-meta` privileged helper (see section 11).
+- **`meta/` is root-owned; agent can read but not write.** The `github-path` and `default-branch` files are written by the `write-repo-meta` privileged helper (called via `sudo` from `add-repo`) and are not writable by the agent user or sandboxed sessions. The `validate_github_path()` cross-validation provides an additional layer for `github-path` by comparing it against the frozen `.git/config` remote URL. `default-branch` has no equivalent cross-validation, but root ownership of `meta/` prevents tampering regardless.
 - **Envoy log rotation has a tiny data loss window.** `copytruncate` copies the log file and then truncates the original. Any log lines written between the copy and truncate operations are lost locally. This is acceptable because CloudWatch has the canonical immutable copy, and the window is typically microseconds.
 - **npm global packages are not auto-updated.** Claude Code and sandbox-runtime require manual updates (see section 12). OS packages are covered by `dnf-automatic`, but npm globals are not. Check for updates periodically.
 - **Envoy has no auto-update mechanism.** The Envoy binary is installed from a GitHub release and must be updated manually (see section 12). Since Envoy holds all credentials and handles all external traffic, it is the highest-severity component to leave unpatched. Subscribe to the [Envoy security advisories](https://github.com/envoyproxy/envoy/security/advisories) and prioritize Envoy CVEs over other updates.
@@ -3347,7 +3475,7 @@ sudo chattr +i /home/agent/.ssh/authorized_keys /home/admin/.ssh/authorized_keys
 
 | Component | Monthly Cost |
 |-----------|-------------|
-| m6g.2xlarge (1yr RI, no upfront) | ~$140 |
+| m8g.2xlarge (1yr RI, no upfront) | ~$165 |
 | 200 GB gp3 (6000 IOPS, 400 MB/s) | ~$22 |
 | EBS snapshots (~200 GB × 7) | ~$2 |
 | NAT gateway (fixed + data) | ~$35 |
@@ -3357,7 +3485,7 @@ sudo chattr +i /home/agent/.ssh/authorized_keys /home/admin/.ssh/authorized_keys
 | S3 session logs | ~$1 |
 | Secrets Manager (1 secret) | ~$0.40 |
 | Data transfer | ~$5 |
-| **Total** | **~$235/mo** |
+| **Total** | **~$260/mo** |
 
 
 ---
@@ -3368,7 +3496,7 @@ Run on-demand for a week to validate, then:
 
 1. Go to **EC2 → Reserved Instances → Purchase Reserved Instances**
 2. Platform: **Linux/UNIX**
-3. Instance type: `m6g.2xlarge`
+3. Instance type: `m8g.2xlarge`
 4. Tenancy: **Default**
 5. Term: **1 year**
 6. Payment option: **No Upfront** (flexible) or **All Upfront** (cheapest)
